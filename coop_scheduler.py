@@ -8,39 +8,58 @@ import math
 from collections import defaultdict
 from copy import deepcopy
 
-ELIGIBLE_KEYS = ["off", "career prep", "business management", "bus mgt", "management"]
-ALT_KEYWORDS = ["alt", "alternate", "alternative"]
+ELIGIBLE_KEYS = [
+    "off",
+    "career prep",
+    "business management",
+    "bus mgt",
+    "bus mgmt",
+    "business mgmt",
+    "management",
+    "mgmt",
+]
+
+ALT_KEYWORDS = [" alt", " alt:", "alternate", "alternative"]  # prefixed space avoids matching 'malto'
 
 def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
+    s = str(s) if s is not None else ""
+    s = s.strip().lower()
+    # collapse all whitespace
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 def is_eligible(subject: str) -> bool:
     s = normalize(subject)
     return any(k in s for k in ELIGIBLE_KEYS)
 
 def is_alternate(name: str) -> bool:
-    """Check if a student is an alternate based on name containing 'alt'"""
-    return any(alt_word in normalize(name) for alt_word in ALT_KEYWORDS)
+    s = " " + normalize(name)  # leading space so "alt" must be its own token-ish
+    return any(k in s for k in ALT_KEYWORDS)
 
 def parse_wide_schedule_str(schedule_str: str) -> dict:
     """
-    Turns '1 - career prep, 2 - algebra, 3 - off, ...' into {1:'career prep', 2:'algebra', 3:'off', ...}
+    Turns '1 - career prep, 2 - algebra, 3 - off, ...' into {1:'career prep', ...}
+    Accepts hyphen, en dash, em dash, or colon.
     """
     periods = {}
     if not isinstance(schedule_str, str) or not schedule_str.strip():
         return periods
-    for entry in schedule_str.split(","):
+
+    # Normalize punctuation variants to a hyphen
+    s = schedule_str.replace("–", "-").replace("—", "-").replace(":", "-")
+
+    for entry in s.split(","):
         entry = entry.strip()
         if not entry:
             continue
-        # allow both "1 - X" and "1: X"
-        m = re.match(r"^\s*(\d+)\s*[-:]\s*(.+?)\s*$", entry)
+        m = re.match(r"^\s*(\d+)\s*-\s*(.+?)\s*$", entry)
         if not m:
             continue
         p = int(m.group(1))
         subj = m.group(2).strip()
         periods[p] = subj
     return periods
+
 
 def load_student_periods(df: pd.DataFrame) -> tuple:
     """
@@ -157,7 +176,16 @@ def next_school_day(d: datetime, skip_weekends: bool) -> datetime:
 def calculate_fairness_metrics(schedule_rows: list, student_data: dict) -> dict:
     """Calculate comprehensive fairness metrics for the schedule"""
     if not schedule_rows:
-        return {"total_score": float('-inf')}
+        return {
+            "total_score": float('-inf'),
+            "shift_std": 0.0,
+            "shift_range": 0,
+            "period_variance": 0.0,
+            "consecutive_penalties": 0,
+            "max_consecutive": 0,
+            "weekday_variance": 0.0,
+            "gap_fairness": 0.0,
+        }
     
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(schedule_rows)
