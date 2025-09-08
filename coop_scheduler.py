@@ -1,4 +1,3 @@
-#coop_scheduler.py
 import argparse
 import pandas as pd
 from datetime import datetime, timedelta
@@ -41,6 +40,23 @@ def parse_wide_schedule_str(schedule_str: str) -> dict:
         subj = m.group(2).strip()
         periods[p] = subj
     return periods
+
+def scan_available_periods(students_dict: dict) -> tuple:
+    """
+    Scan all students to find which periods actually have eligible students.
+    Returns (set of A-day periods with students, set of B-day periods with students)
+    """
+    a_day_periods = set()  # Periods 1-4
+    b_day_periods = set()  # Periods 5-8
+    
+    for student_name, student_data in students_dict.items():
+        for period in student_data['eligible_periods']:
+            if 1 <= period <= 4:
+                a_day_periods.add(period)
+            elif 5 <= period <= 8:
+                b_day_periods.add(period)
+    
+    return a_day_periods, b_day_periods
 
 def load_student_periods(df: pd.DataFrame) -> tuple:
     """
@@ -142,8 +158,12 @@ def day_type_for(idx: int) -> str:
     # idx is the zero-based day counter in the generated schedule window
     return "A" if idx % 2 == 0 else "B"
 
-def periods_for_daytype(day_type: str):
-    return range(1, 5) if day_type == "A" else range(5, 9)
+def periods_for_daytype_with_filter(day_type: str, available_a_periods: set, available_b_periods: set):
+    """Return only the periods that have eligible students for the given day type"""
+    if day_type == "A":
+        return sorted(available_a_periods)
+    else:
+        return sorted(available_b_periods)
 
 def next_school_day(d: datetime, skip_weekends: bool) -> datetime:
     if not skip_weekends:
@@ -156,11 +176,34 @@ def next_school_day(d: datetime, skip_weekends: bool) -> datetime:
 
 def calculate_fairness_metrics(schedule_rows: list, student_data: dict) -> dict:
     """Calculate comprehensive fairness metrics for the schedule"""
+    # Handle empty schedule
     if not schedule_rows:
-        return {"total_score": float('-inf')}
+        return {
+            "total_score": float('-inf'),
+            "shift_std": 0,
+            "shift_range": 0,
+            "period_variance": 0,
+            "consecutive_penalties": 0,
+            "max_consecutive": 0,
+            "weekday_variance": 0,
+            "gap_fairness": 0
+        }
     
     # Convert to DataFrame for easier analysis
     df = pd.DataFrame(schedule_rows)
+    
+    # Handle edge case with single or no assignments
+    if df.empty or len(df) == 0:
+        return {
+            "total_score": float('-inf'),
+            "shift_std": 0,
+            "shift_range": 0,
+            "period_variance": 0,
+            "consecutive_penalties": 0,
+            "max_consecutive": 0,
+            "weekday_variance": 0,
+            "gap_fairness": 0
+        }
     
     # Basic shift distribution
     shift_counts = df.groupby('Student').size()
@@ -180,7 +223,8 @@ def calculate_fairness_metrics(schedule_rows: list, student_data: dict) -> dict:
     for student, periods in period_distribution.items():
         if len(periods) > 1:
             period_counts = list(periods.values())
-            variance = sum((x - sum(period_counts)/len(period_counts))**2 for x in period_counts) / len(period_counts)
+            avg = sum(period_counts) / len(period_counts)
+            variance = sum((x - avg)**2 for x in period_counts) / len(period_counts)
             period_variances.append(variance)
     
     period_variance_score = sum(period_variances) / len(period_variances) if period_variances else 0
@@ -235,9 +279,10 @@ def calculate_fairness_metrics(schedule_rows: list, student_data: dict) -> dict:
             gaps = [(student_dates.iloc[i] - student_dates.iloc[i-1]).days for i in range(1, len(student_dates))]
             if gaps:
                 gap_std = pd.Series(gaps).std()
-                gap_fairness += gap_std
+                if not pd.isna(gap_std):  # Check for NaN
+                    gap_fairness += gap_std
     
-    # Calculate overall fairness score (lower is better)
+    # Calculate overall fairness score (lower is better, but we negate it)
     total_score = -(
         shift_std * 100 +                    # Heavy penalty for uneven shift distribution
         shift_range * 50 +                   # Penalty for range in shifts
@@ -371,6 +416,8 @@ def build_single_schedule(
     student_data: dict,
     start_date: datetime,
     num_days: int,
+    available_a_periods: set,
+    available_b_periods: set,
     max_per_period: int = 2,
     skip_weekends: bool = True,
     seed: int = 42
@@ -387,8 +434,16 @@ def build_single_schedule(
     if not current_student_data:
         return []
     
-    total_periods = num_days * 4  # 4 periods per day (A/B schedule)
-    total_slots = total_periods * max_per_period
+    # Calculate actual available periods
+    total_a_periods = len(available_a_periods)
+    total_b_periods = len(available_b_periods)
+    avg_periods_per_day = (total_a_periods + total_b_periods) / 2.0
+    
+    if avg_periods_per_day == 0:
+        print("Warning: No available periods found!")
+        return []
+    
+    total_slots = num_days * avg_periods_per_day * max_per_period
     target_shifts_per_student = total_slots / len(current_student_data)
     
     # Build schedule
@@ -404,8 +459,11 @@ def build_single_schedule(
         day_type = day_type_for(days_scheduled)
         assigned_today = set()
         
-        # Schedule each period for this day
-        for period in periods_for_daytype(day_type):
+        # Get only available periods for this day type
+        periods = periods_for_daytype_with_filter(day_type, available_a_periods, available_b_periods)
+        
+        # Schedule each available period for this day
+        for period in periods:
             assignments = assign_students_to_period(
                 period, current_date, day_type, current_student_data,
                 assigned_today, max_per_period, target_shifts_per_student, rng
@@ -425,7 +483,8 @@ def build_single_schedule(
     
     return schedule_rows
 
-def get_available_slots(regular_schedule: list, num_days: int, max_per_period: int) -> dict:
+def get_available_slots(regular_schedule: list, num_days: int, max_per_period: int,
+                       available_a_periods: set, available_b_periods: set) -> dict:
     """Calculate which slots are available after regular students are scheduled"""
     # Create a mapping of date-period to current occupancy
     slot_occupancy = defaultdict(int)
@@ -438,8 +497,7 @@ def get_available_slots(regular_schedule: list, num_days: int, max_per_period: i
     available_slots = {}  # date-period -> available_count
     
     # We need to reconstruct the date sequence to know all possible slots
-    current_date = datetime.strptime(regular_schedule[0]['Date'], '%Y-%m-%d') if regular_schedule else None
-    if not current_date:
+    if not regular_schedule:
         return available_slots
     
     # Find earliest date from regular schedule
@@ -454,7 +512,10 @@ def get_available_slots(regular_schedule: list, num_days: int, max_per_period: i
         if current_date.weekday() < 5:  # Weekdays only
             day_type = day_type_for(days_processed)
             
-            for period in periods_for_daytype(day_type):
+            # Use filtered periods based on availability
+            periods = periods_for_daytype_with_filter(day_type, available_a_periods, available_b_periods)
+            
+            for period in periods:
                 slot_key = f"{current_date.strftime('%Y-%m-%d')}-{period}"
                 occupied = slot_occupancy[slot_key]
                 available = max(0, max_per_period - occupied)
@@ -551,7 +612,22 @@ def build_fair_schedule(
 ) -> pd.DataFrame:
     """Build the fairest possible schedule using multiple iterations"""
     
-    print(f"Building schedule with {len(regular_students)} regular students and {len(alternate_students)} alternates...")
+    print(f"\nBuilding schedule with {len(regular_students)} regular students and {len(alternate_students)} alternates...")
+    
+    # Scan for available periods across all students
+    all_students = {**regular_students, **alternate_students}
+    available_a_periods, available_b_periods = scan_available_periods(all_students)
+    
+    print(f"Available A-day periods: {sorted(available_a_periods) if available_a_periods else 'None'}")
+    print(f"Available B-day periods: {sorted(available_b_periods) if available_b_periods else 'None'}")
+    
+    # Check if we have any valid periods
+    if not available_a_periods and not available_b_periods:
+        print("\nERROR: No eligible periods found for any students!")
+        print("Please check that students have classes matching these keywords:")
+        print(f"  {ELIGIBLE_KEYS}")
+        return pd.DataFrame()
+    
     print(f"Running {num_iterations} iterations to find the fairest schedule...")
     
     best_combined_schedule = []
@@ -562,7 +638,7 @@ def build_fair_schedule(
     best_regular_schedule = []
     best_regular_score = float('-inf')
     
-    print("Phase 1: Optimizing regular student schedule...")
+    print("\nPhase 1: Optimizing regular student schedule...")
     for iteration in range(num_iterations):
         iteration_seed = seed + iteration
         print(f"  Regular iteration {iteration + 1}/{num_iterations}...")
@@ -570,6 +646,7 @@ def build_fair_schedule(
         # Build schedule for regular students
         regular_schedule = build_single_schedule(
             regular_students, start_date, num_days, 
+            available_a_periods, available_b_periods,
             max_per_period, skip_weekends, iteration_seed
         )
         
@@ -581,50 +658,71 @@ def build_fair_schedule(
             best_regular_schedule = regular_schedule
             print(f"    New best regular score: {best_regular_score:.2f}")
     
-    print(f"Best regular schedule found with score: {best_regular_score:.2f}")
+    if not best_regular_schedule:
+        print("\nWarning: No valid regular schedule could be created!")
+        print("This might happen if:")
+        print("  - No regular students have eligible periods")
+        print("  - All constraints prevent any valid assignments")
+    else:
+        print(f"\nBest regular schedule found with score: {best_regular_score:.2f}")
     
     # Now build alternates schedule using the same fairness model
     if alternate_students:
         print("\nPhase 2: Optimizing alternate student schedule...")
         
         # Get available slots after regular students are scheduled
-        available_slots = get_available_slots(best_regular_schedule, num_days, max_per_period)
-        
-        # Build fair alternate schedule
-        best_alternate_schedule = build_alternate_schedule_for_slots(
-            alternate_students, available_slots, seed, num_iterations
+        available_slots = get_available_slots(
+            best_regular_schedule, num_days, max_per_period,
+            available_a_periods, available_b_periods
         )
         
-        # Combine schedules
-        best_combined_schedule = best_regular_schedule + best_alternate_schedule
-        
-        # Evaluate combined fairness
-        combined_metrics = calculate_fairness_metrics(
-            best_combined_schedule, {**regular_students, **alternate_students}
-        )
-        
-        # Also get separate alternate metrics
-        alt_metrics = calculate_fairness_metrics(best_alternate_schedule, alternate_students)
-        
-        print(f"\nAlternate schedule metrics:")
-        print(f"  Alternate fairness score: {alt_metrics['total_score']:.2f}")
-        print(f"  Alternate shift std: {alt_metrics['shift_std']:.2f}")
-        print(f"  Alternate shift range: {alt_metrics['shift_range']}")
-        
-        best_metrics = combined_metrics
-        best_combined_score = combined_metrics["total_score"]
-        
+        if available_slots:
+            # Build fair alternate schedule
+            best_alternate_schedule = build_alternate_schedule_for_slots(
+                alternate_students, available_slots, seed, num_iterations
+            )
+            
+            # Combine schedules
+            best_combined_schedule = best_regular_schedule + best_alternate_schedule
+            
+            # Evaluate combined fairness
+            combined_metrics = calculate_fairness_metrics(
+                best_combined_schedule, {**regular_students, **alternate_students}
+            )
+            
+            # Also get separate alternate metrics
+            if best_alternate_schedule:
+                alt_metrics = calculate_fairness_metrics(best_alternate_schedule, alternate_students)
+                
+                print(f"\nAlternate schedule metrics:")
+                print(f"  Alternate fairness score: {alt_metrics['total_score']:.2f}")
+                print(f"  Alternate shift std: {alt_metrics['shift_std']:.2f}")
+                print(f"  Alternate shift range: {alt_metrics['shift_range']}")
+            
+            best_metrics = combined_metrics
+            best_combined_score = combined_metrics["total_score"]
+        else:
+            print("  No available slots for alternates after regular scheduling")
+            best_combined_schedule = best_regular_schedule
+            best_metrics = calculate_fairness_metrics(best_regular_schedule, regular_students)
     else:
         best_combined_schedule = best_regular_schedule
-        best_metrics = calculate_fairness_metrics(best_regular_schedule, regular_students)
+        if best_combined_schedule:
+            best_metrics = calculate_fairness_metrics(best_regular_schedule, regular_students)
+        else:
+            best_metrics = calculate_fairness_metrics([], {})
     
-    print(f"\nFinal combined schedule metrics:")
-    print(f"  Total fairness score: {best_metrics['total_score']:.2f}")
-    print(f"  Shift standard deviation: {best_metrics['shift_std']:.2f}")
-    print(f"  Shift range: {best_metrics['shift_range']}")
-    print(f"  Period variance: {best_metrics['period_variance']:.2f}")
-    print(f"  Consecutive penalties: {best_metrics['consecutive_penalties']}")
-    print(f"  Max consecutive days: {best_metrics['max_consecutive']}")
+    # Print final metrics only if we have a valid schedule
+    if best_combined_schedule and best_metrics["total_score"] != float('-inf'):
+        print(f"\nFinal combined schedule metrics:")
+        print(f"  Total fairness score: {best_metrics['total_score']:.2f}")
+        print(f"  Shift standard deviation: {best_metrics['shift_std']:.2f}")
+        print(f"  Shift range: {best_metrics['shift_range']}")
+        print(f"  Period variance: {best_metrics['period_variance']:.2f}")
+        print(f"  Consecutive penalties: {best_metrics['consecutive_penalties']}")
+        print(f"  Max consecutive days: {best_metrics['max_consecutive']}")
+    else:
+        print("\nNo valid schedule could be created with the given constraints.")
     
     return pd.DataFrame(best_combined_schedule)
 
@@ -648,11 +746,50 @@ def main():
         start_date = datetime(today.year, today.month, 1)
 
     # Load Excel (first sheet)
-    df = pd.read_excel(args.input)
-    regular_students, alternate_students = load_student_periods(df)
+    try:
+        df = pd.read_excel(args.input)
+    except Exception as e:
+        print(f"Error loading input file: {e}")
+        return
     
-    print(f"Loaded {len(regular_students)} regular students and {len(alternate_students)} alternates")
+    # Load student periods
+    try:
+        regular_students, alternate_students = load_student_periods(df)
+    except Exception as e:
+        print(f"Error parsing student data: {e}")
+        print("Please ensure your spreadsheet has either:")
+        print("  - Columns [Name, Schedule] where Schedule is like '1 - Math, 2 - Off, ...'")
+        print("  - Columns [Name, Period, Class]")
+        return
+    
+    print(f"\nLoaded {len(regular_students)} regular students and {len(alternate_students)} alternates")
+    
+    # Perform sanity checks
+    all_students = {**regular_students, **alternate_students}
+    if not all_students:
+        print("\nERROR: No students found in the spreadsheet!")
+        return
+    
+    # Check if any students have eligible periods
+    total_eligible_periods = sum(len(s['eligible_periods']) for s in all_students.values())
+    if total_eligible_periods == 0:
+        print("\nERROR: No students have eligible periods!")
+        print("Eligible subjects must contain one of these keywords:")
+        for keyword in ELIGIBLE_KEYS:
+            print(f"  - {keyword}")
+        return
+    
+    # Show which students have which eligible periods (for debugging)
+    print("\nEligible periods by student:")
+    for name, data in sorted(all_students.items())[:5]:  # Show first 5 for brevity
+        if data['eligible_periods']:
+            student_type = "ALT" if is_alternate(name) else "REG"
+            periods_str = ", ".join(map(str, data['eligible_periods']))
+            print(f"  {name} ({student_type}): periods {periods_str}")
+    if len(all_students) > 5:
+        print(f"  ... and {len(all_students) - 5} more students")
 
+    # Build the schedule
     schedule_df = build_fair_schedule(
         regular_students=regular_students,
         alternate_students=alternate_students,
@@ -664,47 +801,97 @@ def main():
         num_iterations=args.iterations
     )
 
+    # Check if we got a valid schedule
+    if schedule_df.empty:
+        print("\nNo valid schedule could be generated. Please check:")
+        print("  1. Students have eligible periods (containing 'off', 'career prep', 'management', etc.)")
+        print("  2. The constraints (max per period, days, etc.) allow for valid assignments")
+        print("  3. The input data is correctly formatted")
+        return
+
     # Create detailed summary with fairness metrics
-    if not schedule_df.empty:
-        summary = schedule_df.groupby("Student").agg({
-            'Date': 'count',
-            'Period': lambda x: list(x)
-        }).rename(columns={'Date': 'Total_Shifts', 'Period': 'Periods_Worked'})
-        
-        summary['Period_Distribution'] = summary['Periods_Worked'].apply(
-            lambda periods: {p: periods.count(p) for p in set(periods)}
-        )
-        summary['Unique_Periods'] = summary['Periods_Worked'].apply(lambda x: len(set(x)))
-        summary = summary.drop('Periods_Worked', axis=1)
-        summary = summary.reset_index().sort_values("Total_Shifts", ascending=False)
-        
-        # Add student type indicator
-        summary['Type'] = summary['Student'].apply(
-            lambda x: 'Alternate' if is_alternate(x) else 'Regular'
-        )
-    else:
-        summary = pd.DataFrame()
+    summary = schedule_df.groupby("Student").agg({
+        'Date': 'count',
+        'Period': lambda x: list(x)
+    }).rename(columns={'Date': 'Total_Shifts', 'Period': 'Periods_Worked'})
+    
+    summary['Period_Distribution'] = summary['Periods_Worked'].apply(
+        lambda periods: {p: periods.count(p) for p in set(periods)}
+    )
+    summary['Unique_Periods'] = summary['Periods_Worked'].apply(lambda x: len(set(x)))
+    summary = summary.drop('Periods_Worked', axis=1)
+    summary = summary.reset_index().sort_values("Total_Shifts", ascending=False)
+    
+    # Add student type indicator
+    summary['Type'] = summary['Student'].apply(
+        lambda x: 'Alternate' if is_alternate(x) else 'Regular'
+    )
 
     # Save results
-    with pd.ExcelWriter(args.out, engine="openpyxl") as writer:
-        schedule_df.to_excel(writer, index=False, sheet_name="Schedule")
-        if not summary.empty:
-            summary.to_excel(writer, index=False, sheet_name="Summary")
+    try:
+        with pd.ExcelWriter(args.out, engine="openpyxl") as writer:
+            schedule_df.to_excel(writer, index=False, sheet_name="Schedule")
+            if not summary.empty:
+                summary.to_excel(writer, index=False, sheet_name="Summary")
+        print(f"\nSuccessfully wrote schedule to {args.out}")
+    except Exception as e:
+        print(f"\nError saving Excel file: {e}")
+        # Try to save as CSV as backup
+        try:
+            backup_csv = args.out.replace('.xlsx', '_backup.csv')
+            schedule_df.to_csv(backup_csv, index=False)
+            print(f"Saved backup to {backup_csv}")
+        except:
+            pass
 
     if args.csv:
-        schedule_df.to_csv(args.csv, index=False)
-
-    print(f"\nWrote schedule to {args.out}")
-    if args.csv:
-        print(f"Wrote CSV to {args.csv}")
+        try:
+            schedule_df.to_csv(args.csv, index=False)
+            print(f"Wrote CSV to {args.csv}")
+        except Exception as e:
+            print(f"Error saving CSV file: {e}")
     
-    if not schedule_df.empty:
-        print(f"\nSchedule contains {len(schedule_df)} total assignments")
-        print(f"Assignments per student:")
-        student_counts = schedule_df.groupby('Student').size().sort_values(ascending=False)
-        for student, count in student_counts.items():
-            student_type = "ALT" if is_alternate(student) else "REG"
-            print(f"  {student} ({student_type}): {count} shifts")
+    # Print final statistics
+    print(f"\nSchedule Statistics:")
+    print(f"  Total assignments: {len(schedule_df)}")
+    print(f"  Date range: {schedule_df['Date'].min()} to {schedule_df['Date'].max()}")
+    print(f"  Unique students scheduled: {schedule_df['Student'].nunique()}")
+    
+    # Show assignment distribution
+    print(f"\nAssignments per student:")
+    student_counts = schedule_df.groupby('Student').size().sort_values(ascending=False)
+    
+    # Separate regular and alternate students
+    regular_counts = []
+    alternate_counts = []
+    
+    for student, count in student_counts.items():
+        if is_alternate(student):
+            alternate_counts.append((student, count))
+        else:
+            regular_counts.append((student, count))
+    
+    # Show regular students
+    if regular_counts:
+        print("  Regular students:")
+        for student, count in regular_counts[:10]:  # Show top 10
+            print(f"    {student}: {count} shifts")
+        if len(regular_counts) > 10:
+            print(f"    ... and {len(regular_counts) - 10} more regular students")
+    
+    # Show alternate students
+    if alternate_counts:
+        print("  Alternate students:")
+        for student, count in alternate_counts[:10]:  # Show top 10
+            print(f"    {student}: {count} shifts")
+        if len(alternate_counts) > 10:
+            print(f"    ... and {len(alternate_counts) - 10} more alternate students")
+    
+    # Show period distribution
+    print(f"\nPeriod distribution:")
+    period_counts = schedule_df['Period'].value_counts().sort_index()
+    for period, count in period_counts.items():
+        print(f"  Period {period}: {count} assignments")
 
 if __name__ == "__main__":
     main()
